@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Minimal APK Generator</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+</head>
+<body>
+
+  <h2>Minimal APK Generator</h2>
+
+  <label>Target Package ID:</label>
+  <input type="text" id="target-id" value="com.example.noopapp.identifier"><br><br>
+
+  <label>Version Code (Integer):</label>
+  <input type="text" id="version-code" value="1"><br><br>
+
+  <label>Version Name (String):</label>
+  <input type="text" id="version-name" value="1.0.0"><br><br>
+
+  <button id="btn-build">Generate & Sign APK</button>
+  <p id="status">Status: Ready</p>
+
+  <script type="module">
+    import { PackageSigner } from 'https://esm.run/@chromeos/android-package-signer';
+
+    // Helper to generate a fixed-size UTF-16 LE array padded safely with null bytes
+    function stringToFixedUtf16LE(str, charLength) {
+      const byteLength = charLength * 2;
+      const arr = new Uint8Array(byteLength);
+      for (let i = 0; i < str.length && i < charLength; i++) {
+        const code = str.charCodeAt(i);
+        arr[i * 2] = code & 0xff;
+        arr[i * 2 + 1] = (code >> 8) & 0xff;
+      }
+      return arr;
+    }
+
+    // Helper to encode strings to standard UTF-16 LE
+    function encodeUtf16LE(str) {
+      const arr = new Uint8Array(str.length * 2);
+      for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i);
+        arr[i * 2] = code & 0xff;
+        arr[i * 2 + 1] = (code >> 8) & 0xff;
+      }
+      return arr;
+    }
+
+    // Helper to convert an integer number string to a 4-byte little-endian uint32
+    function intToUint32LE(numString) {
+      const num = parseInt(numString, 10) || 1;
+      const arr = new Uint8Array(4);
+      arr[0] = num & 0xff;
+      arr[1] = (num >> 8) & 0xff;
+      arr[2] = (num >> 16) & 0xff;
+      arr[3] = (num >> 24) & 0xff;
+      return arr;
+    }
+
+    // Helper to decode text hex pools to true byte streams
+    function hexToUint8Array(hexString) {
+      const cleanHex = hexString.replace(/\s+/g, '');
+      if (cleanHex.length % 2 !== 0) return new Uint8Array(0);
+      const arr = new Uint8Array(cleanHex.length / 2);
+      for (let i = 0; i < arr.length; i++) {
+        arr[i] = parseInt(cleanHex.substr(i * 2, 2), 16);
+      }
+      return arr;
+    }
+
+    // Standard baseline replacement loop
+    function findAndReplaceBytes(sourceArray, searchBytes, replaceBytes) {
+      if (!sourceArray || !searchBytes || !replaceBytes) return false;
+      for (let i = 0; i <= sourceArray.length - searchBytes.length; i++) {
+        let match = true;
+        for (let j = 0; j < searchBytes.length; j++) {
+          if (sourceArray[i + j] !== searchBytes[j]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          sourceArray.set(replaceBytes, i);
+          return true; 
+        }
+      }
+      return false;
+    }
+
+    // Patches the string length prefix and contents in place without shifting file layout or breaking alignment
+    function patchManifestStringInPlace(manifestBytes, oldString, newString, maxCharLength) {
+      const oldBytes = encodeUtf16LE(oldString);
+      
+      // Find the raw offset of the placeholder string
+      let stringOffset = -1;
+      for (let i = 0; i <= manifestBytes.length - oldBytes.length; i++) {
+        let match = true;
+        for (let j = 0; j < oldBytes.length; j++) {
+          if (manifestBytes[i + j] !== oldBytes[j]) { match = false; break; }
+        }
+        if (match) { stringOffset = i; break; }
+      }
+
+      if (stringOffset === -1) return false;
+
+      // 1. Update the 2-byte explicit UTF-16 length field right before the string characters
+      const lengthOffset = stringOffset - 2;
+      manifestBytes[lengthOffset] = newString.length & 0xff;
+      manifestBytes[lengthOffset + 1] = (newString.length >> 8) & 0xff;
+
+      // 2. Generate the perfectly sized payload inside the static character slot bounds
+      const replacementPayload = stringToFixedUtf16LE(newString, maxCharLength);
+
+      // 3. Overwrite the exact byte slot mapping
+      manifestBytes.set(replacementPayload, stringOffset);
+      return true;
+    }
+
+    // ==========================================
+    // PLACEHOLDER HEX DATA CONFIG
+    // ==========================================
+    const MANIFEST_HEX = "03000800b808000001001c00000500002000000000000000000000009c00000000000000000000000e0000001a0000002e0000004c0000006600000080000000a4000000be000000d8000000fe000000240100005a010000620100007001000094010000a4010000b8010000ca01000002020000460200009c020000b6020000ca020000320300008a030000a8030000bc030000d6030000e80300001c0400005004000005006c006100620065006c00000004006e0061006d006500000008006500780070006f00720074006500640000000d006d0069006e00530064006b00560065007200730069006f006e0000000b00760065007200730069006f006e0043006f006400650000000b00760065007200730069006f006e004e0061006d00650000001000740061007200670065007400530064006b00560065007200730069006f006e0000000b0061006c006c006f0077004200610063006b007500700000000b0073007500700070006f00720074007300520074006c000000110065007800740072006100630074004e00610074006900760065004c006900620073000000110063006f006d00700069006c006500530064006b00560065007200730069006f006e000000190063006f006d00700069006c006500530064006b00560065007200730069006f006e0043006f00640065006e0061006d00650000000200310032000000050045006d007000740079000000100059005900590059005900590059005900590059005900590059005900590059000000060061006300740069006f006e0000000800610063007400690076006900740079000000070061006e00640072006f006900640000001a0061006e00640072006f00690064002e0069006e00740065006e0074002e0061006300740069006f006e002e004d00410049004e000000200061006e00640072006f00690064002e0069006e00740065006e0074002e00630061007400650067006f00720079002e004c00410055004e0043004800450052000000290061006e00640072006f00690064002e0069006e00740065006e0074002e00630061007400650067006f00720079002e004c00450041004e004200410043004b005f004c00410055004e00430048004500520000000b006100700070006c00690063006100740069006f006e0000000800630061007400650067006f00720079000000320063006f006d002e00780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780078007800780000002a0068007400740070003a002f002f0073006300680065006d00610073002e0061006e00640072006f00690064002e0063006f006d002f00610070006b002f007200650073002f0061006e00640072006f006900640000000d0069006e00740065006e0074002d00660069006c00740065007200000008006d0061006e006900660065007300740000000b006e006f0070002e006e006f0070002e004e004f005000000007007000610063006b006100670065000000180070006c006100740066006f0072006d004200750069006c006400560065007200730069006f006e0043006f00640065000000180070006c006100740066006f0072006d004200750069006c006400560065007200730069006f006e004e0061006d0065000000080075007300650073002d00730064006b00000080010800380000000100010103000101100001010c0201011b0201011c0201017002010180020101af030101ea0401017205010173050101000110001800000002000000ffffffff110000001800000002011000b000000002000000ffffffffffffffff1a0000001400140007000000000000001800000004000000ffffffff080000103f420f0018000000050000000e000000080000030e000000180000000a000000ffffffff080000101f000000180000000b0000000c000000080000030c000000ffffffff1c000000170000000800000317000000ffffffff1d000000ffffffff080000101f000000ffffffff1e000000ffffffff080000100c000000020110004c00000007000000ffffffffffffffff1f0000001400140002000000000000001800000003000000ffffffff080000101d0000001800000006000000ffffffff080000101d000000030110001800000007000000ffffffffffffffff1f00000002011000740000000b000000ffffffffffffffff1500000014001400040000000000000018000000000000000d000000080000030d0000001800000007000000ffffffff08000012ffffffff1800000008000000ffffffff08000012ffffffff1800000009000000ffffffff0800001200000000020110004c00000010000000ffffffffffffffff1000000014001400020000000000000018000000010000001b000000080000031b0000001800000002000000ffffffff08000012ffffffff020110002400000013000000ffffffffffffffff19000000140014000000000000000000020110003800000014000000ffffffffffffffff0f0000001400140001000000000000001800000001000000120000000800000312000000030110001800000014000000ffffffffffffffff0f000000020110003800000016000000ffffffffffffffff160000001400140001000000000000001800000001000000130000000800000313000000030110001800000016000000ffffffffffffffff16000000020110003800000017000000ffffffffffffffff160000001400140001000000000000001800000001000000140000000800000314000000030110001800000017000000ffffffffffffffff16000000030110001800000013000000ffffffffffffffff19000000030110001800000010000000ffffffffffffffff1000000003011000180000000b000000ffffffffffffffff15000000030110001800000002000000ffffffffffffffff1a000000010110001800000002000000ffffffff1100000018000000";
+    const DEX_HEX = "6465780a303339007ef5f131607b02dc45a745d1741f6727591da0dda5cd92c35405000070000000785634120000000000000000a804000019000000700000000a000000d400000002000000fc0000000500000014010000080000003c010000030000007c01000078030000dc010000560200005e0200006e0200007a0200008c0200009302000096020000ae020000c3020000050300003d0300005103000065030000740300007e030000810300008f0300009d030000a1030000b3030000b6030000ea030000f2030000fc0300000504000005000000060000000700000008000000090000000a0000000b0000000c0000000e000000130000000e0000000800000000000000110000000800000050020000030006000100000003000600020000000300090004000000030000000f0000000300060010000000010000000000000001000100160000000300000000000000040000000000000005000000000000000700000000000000070000001500000007000100160000000300000011000000050000000000000003000000000000006f0400009b04000004000000110000000500000000000000ffffffff000000008304000000000000070000000100000001000000000000000d000000000000008d04000000000000010001000100000042020000040000007010040000000e00010001000100000000000000040000007010040000000e00010001000100000046020000040000007010000000000e0002000200020000004a020000070000006f20010010006e10060000000e0006000e0012000e001601000e3c00010000000200063c696e69743e000e4150504c49434154494f4e5f4944000a4255494c445f5459504500104275696c64436f6e6669672e6a6176610005444542554700014900164c616e64726f69642f6170702f41637469766974793b00134c616e64726f69642f6f732f42756e646c653b00404c636f6d2f787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878782f4275696c64436f6e6669673b00364c636f6d2f787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878782f523b00124c6a6176612f6c616e672f4f626a6563743b00124c6a6176612f6c616e672f537472696e673b000d4c6e6f702f6e6f702f4e4f503b00084e4f502e6a617661000156000c56455253494f4e5f434f4445000c56455253494f4e5f4e414d450002564c00105959595959595959595959595959595900015a0032636f6d2e78787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878000666696e69736800086f6e437265617465000772656c6561736500687e7e44387b226261636b656e64223a22646578222c22636f6d70696c6174696f6e2d6d6f6465223a2272656c65617365222c226861732d636865636b73756d73223a66616c73652c226d696e2d617069223a32392c2276657273696f6e223a22332e302e3639227d00050001000019011901190119011902818004dc030000010003828004f40300000101058180048c040701a40405171417171f443f420f1712000e000000000000000100000000000000010000001900000070000000020000000a000000d40000000300000002000000fc00000004000000050000001401000005000000080000003c01000006000000030000007c0100000120000004000000dc01000003200000030000004202000001100000010000005002000002200000190000005602000000200000030000006f04000005200000010000009b0400000010000001000000a8040000";
+    
+    // Clean pre-compiled empty single-package framework schema accepted by Android Studio & Apktool
+    const ARSC_HEX = "02000c00280000000000000001001c001c0000000000000000000000000100001c00000000000000";
+
+    const PKG_STRING_LENGTH = 50; 
+    const SEARCH_PATTERN = "com." + "x".repeat(PKG_STRING_LENGTH - 4);
+    const NAME_STRING_LENGTH = 16;
+
+    document.getElementById('btn-build').addEventListener('click', async () => {
+      const status = document.getElementById('status');
+      const targetIdStr = document.getElementById('target-id').value;
+      const versionCodeStr = document.getElementById('version-code').value;
+      const versionNameStr = document.getElementById('version-name').value;
+
+      if (targetIdStr.length > PKG_STRING_LENGTH) {
+        alert(`Package ID is too long! Must be ${PKG_STRING_LENGTH} characters or less.`);
+        return;
+      }
+
+      try {
+        status.innerText = "Processing arrays...";
+        
+        const manifestBytes = hexToUint8Array(MANIFEST_HEX);
+        const dexBytes = hexToUint8Array(DEX_HEX);
+        const arscBytes = hexToUint8Array(ARSC_HEX);
+
+        if (manifestBytes.length === 0) {
+          throw new Error("MANIFEST_HEX parsed to an empty byte array. Provide your template hex values.");
+        }
+
+        // 1. In-place Package ID patch (No layout shifting, preserves strict alignment)
+        if (!patchManifestStringInPlace(manifestBytes, SEARCH_PATTERN, targetIdStr, PKG_STRING_LENGTH)) {
+          throw new Error("Could not find the Package ID placeholder token string inside the manifest data structure.");
+        }
+
+        // 2. Patch Version Code (uint32 Little Endian match for 1000000 placeholder)
+        const searchCode = new Uint8Array([0x3f, 0x42, 0x0f, 0x00]); 
+        const replaceCode = intToUint32LE(versionCodeStr);
+        if (!findAndReplaceBytes(manifestBytes, searchCode, replaceCode)) {
+          throw new Error("Could not find the Version Code uint32 placeholder inside your manifest data.");
+        }
+
+        // 3. Patch Version Name (UTF-16 LE In-place Length Patching)
+        const placeholderName = "Y".repeat(NAME_STRING_LENGTH);
+        if (!patchManifestStringInPlace(manifestBytes, placeholderName, versionNameStr, NAME_STRING_LENGTH)) {
+          throw new Error("Could not find the Version Name placeholder string inside your manifest data.");
+        }
+
+        // 4. Structural Packaging
+        status.innerText = "Zipping bundle...";
+        const zip = new JSZip();
+        zip.file("AndroidManifest.xml", manifestBytes);
+        zip.file("classes.dex", dexBytes);
+        zip.file("resources.arsc", arscBytes);
+
+        // Standard uncompressed package mode required by APK structures
+        const unsignedBlob = await zip.generateAsync({ 
+          type: "blob",
+          compression: "STORE" 
+        });
+
+        // Convert raw bundle blob to standard browser File object for signer alignment
+        const unsignedFile = new File([unsignedBlob], "app-unsigned.apk", {
+          type: "application/vnd.android.package-archive",
+          lastModified: Date.now()
+        });
+
+        // 5. Package Signing Toolchain Execution
+        status.innerText = "Signing package...";
+        const packageSigner = new PackageSigner('pass123', 'android');
+        const base64Keystore = await packageSigner.generateKey({
+          commonName: 'NoOp Signer',
+          organizationName: 'Local',
+          organizationUnit: 'Dev',
+          countryCode: 'US'
+        });
+
+        let signedBase64 = await packageSigner.signPackage(unsignedFile, base64Keystore, 'Signer');
+
+        if (!signedBase64) {
+          throw new Error("The signing engine produced an empty payload.");
+        }
+
+        if (signedBase64.startsWith("data:")) {
+          signedBase64 = signedBase64.substring(signedBase64.indexOf(",") + 1);
+        }
+        signedBase64 = signedBase64.trim().replace(/\s/g, "");
+
+        if (!/^[A-Za-z0-9+/=\s]+$/.test(signedBase64)) {
+          throw new Error("The signer output internal error text instead of a binary base64 stream: " + signedBase64);
+        }
+
+        status.innerText = "Downloading...";
+        const byteCharacters = atob(signedBase64);
+        const byteNumbers = new Array(byteCharacters.length);
+        for (let i = 0; i < byteCharacters.length; i++) {
+          byteNumbers[i] = byteCharacters.charCodeAt(i);
+        }
+        const byteArray = new Uint8Array(byteNumbers);
+        const finalApkBlob = new Blob([byteArray], { type: 'application/vnd.android.package-archive' });
+
+        const downloadUrl = URL.createObjectURL(finalApkBlob);
+        const a = document.createElement('a');
+        a.href = downloadUrl;
+        a.download = "generated_noop.apk";
+        document.body.appendChild(a);
+        a.click();
+        
+        document.body.removeChild(a);
+        URL.revokeObjectURL(downloadUrl);
+        status.innerText = "Status: Done!";
+
+      } catch (err) {
+        alert(err.message);
+        status.innerText = "Status: Stopped on Error";
+      }
+    });
+  </script>
+</body>
+</html>
